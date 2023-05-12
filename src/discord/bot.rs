@@ -1,23 +1,27 @@
 use std::env;
 
-use serenity::model::prelude::{ChannelId, MessageId, MessageUpdateEvent};
-use serenity::{async_trait, model::prelude::GuildId};
+use anyhow::{anyhow, bail, Result};
+use serenity::http::Http;
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
+use serenity::model::prelude::{ChannelId, MessageId, MessageUpdateEvent};
 use serenity::prelude::*;
+use serenity::{async_trait, model::prelude::GuildId};
 
-use crate::{matrix, Entry};
-use crate::{CONFIG, chat_service::{self, FullMessage, User}};
+use crate::{
+    chat_service::{self, FullMessage, User},
+    CONFIG,
+};
+use crate::{matrix, Entry, DATABASE};
 
 struct Handler;
 
 lazy_static! {
-    pub static ref CONTEXT: std::sync::Mutex<Option<Context>> = std::sync::Mutex::new(None);
+    pub static ref CONTEXT: parking_lot::Mutex<Option<Context>> = parking_lot::Mutex::new(None);
 }
 
 // I pass guild id as argument as replies do not have guild id correctly set
-fn message_to_relayed_message(msg: Message, guild_id: String) -> chat_service::Message
-{
+fn message_to_relayed_message(msg: Message, guild_id: String) -> chat_service::Message {
     let relay_msg = chat_service::Message {
         service: "discord".to_owned(),
         id: msg.id.to_string(),
@@ -30,18 +34,17 @@ fn message_to_relayed_message(msg: Message, guild_id: String) -> chat_service::M
 async fn author_to_user(author: serenity::model::prelude::User) -> User {
     return User {
         source: "discord".to_string(), // Source, e.g matrix, discord
-        id: author.id.to_string(), // Actual id
+        id: author.id.to_string(),     // Actual id
         ping: format!("<@{}>", author.id.to_string()), // Used to mention user
         tag: format!("{}", author.tag()), // Used to tag (kinda)
         display: author.name.to_owned(), // Display Name
-        avatar: author.avatar
+        avatar: author.avatar,
     };
 }
 
 async fn message_to_full_message(msg: Message) -> chat_service::FullMessage {
-    let ctx = (*(CONTEXT.lock().unwrap())).clone().unwrap();
+    let ctx = (*CONTEXT.lock()).clone().unwrap();
     let nick = msg.clone().author_nick(ctx.http.clone()).await.clone();
-
 
     /*let user = User {
         source: "discord".to_string(), // Source, e.g matrix, discord
@@ -61,14 +64,17 @@ async fn message_to_full_message(msg: Message) -> chat_service::FullMessage {
     if msg.referenced_message.is_some() {
         //TODO: This may be recursive...
         let replyed_msg = *(msg.referenced_message.unwrap());
-        reply = Some(Box::new(message_to_relayed_message(replyed_msg, msg.guild_id.unwrap().to_string())));
+        reply = Some(Box::new(message_to_relayed_message(
+            replyed_msg,
+            msg.guild_id.unwrap().to_string(),
+        )));
     }
 
     let full_msg = FullMessage {
         user: user,
         message: relay_msg,
         content: msg.content.clone(),
-        reply: reply
+        reply: reply,
     };
 
     return full_msg;
@@ -76,7 +82,7 @@ async fn message_to_full_message(msg: Message) -> chat_service::FullMessage {
 
 pub async fn relayed_message_to_message(msg: chat_service::Message) -> Option<Message> {
     // This may or may not work...
-    let ctx = (*(CONTEXT.lock().unwrap())).clone().unwrap();
+    let ctx = (*CONTEXT.lock()).clone().unwrap();
     let guild_id = GuildId(msg.server_id.parse::<u64>().unwrap());
     let channel_id = ChannelId(msg.room_id.parse::<u64>().unwrap());
     let channels = guild_id.channels(ctx.http.clone()).await;
@@ -103,11 +109,14 @@ impl EventHandler for Handler {
             return;
         }
 
-        let room = CONFIG.room.iter().find(|room| room.discord == msg.channel_id.to_string());
+        let room = CONFIG
+            .room
+            .iter()
+            .find(|room| room.discord == msg.channel_id.0);
         if room.is_some() {
             let relay_msg = message_to_full_message(msg).await;
             let relayed = matrix::relay::relay_message(relay_msg.clone()).await;
-                
+
             chat_service::create_message(relay_msg.message, relayed);
         }
     }
@@ -125,7 +134,7 @@ impl EventHandler for Handler {
             room_id: channel_id.to_string(),
             id: deleted_message_id.to_string(),
         };
-        
+
         matrix::relay::delete_message(msg.clone()).await;
         chat_service::delete_message(msg.clone());
     }
@@ -144,12 +153,11 @@ impl EventHandler for Handler {
             server_id: event.guild_id.unwrap().to_string(),
         };
 
-
         let relay_msg = chat_service::FullMessage {
             content: event.content.unwrap().clone(),
             user: author_to_user(event.author.unwrap()).await,
             message: relay_msg,
-            reply: None
+            reply: None,
         };
         matrix::relay::edit_message(relay_msg).await;
     }
@@ -161,9 +169,47 @@ impl EventHandler for Handler {
     //
     // In this case, just print what the current user's username is.
     async fn ready(&self, ctx: Context, ready: Ready) {
-        (*(CONTEXT.lock().unwrap())) = Some(ctx.clone());
+        *CONTEXT.lock() = Some(ctx.clone());
         println!("{} is connected!", ready.user.name);
     }
+}
+
+pub async fn get_or_create_webhook_url(http: &Http, channel_id: u64) -> Result<String> {
+    let webhook_prefix = format!("https://discord.com/api/webhooks/{channel_id}/");
+
+    let database = DATABASE.lock();
+    // get webhook url from database
+    let mut stmt = database.prepare("SELECT webhook_token FROM discord_channels WHERE id=:s")?;
+    let mut iter = stmt.query_map(&[(":s", &channel_id)], |row| {
+        Ok(row.get::<usize, String>(0)?)
+    })?;
+
+    let database_webhook_token = iter.next().map(|x| x.unwrap());
+    // it's already in the database :)
+    if let Some(webhook_token) = database_webhook_token {
+        return Ok(format!("{webhook_prefix}{webhook_token}"));
+    }
+
+    // ok the bot's gonna have to make the webhook
+    let webhook = http
+        .create_webhook(
+            channel_id,
+            &serenity::json::json!({"name": "Matrix Bridge"}),
+            Some("Make bridge webhook because it wasn't in the database"),
+        )
+        .await?;
+
+    let Some(token) = webhook.token else {
+        bail!("Webhook token is None")
+    };
+
+    // add it to the database
+    database.execute(
+        "INSERT OR IGNORE INTO discord_channels (id, webhook_token) VALUES (?, ?)",
+        (channel_id, &token),
+    )?;
+
+    Ok(format!("{webhook_prefix}{token}"))
 }
 
 pub async fn start_bot() {
@@ -178,9 +224,10 @@ pub async fn start_bot() {
     // Create a new instance of the Client, logging in as a bot. This will
     // automatically prepend your bot token with "Bot ", which is a requirement
     // by Discord for bot users.
-    let mut client =
-        Client::builder(&token, intents).event_handler(Handler).await.expect("Err creating client");
-
+    let mut client = Client::builder(&token, intents)
+        .event_handler(Handler)
+        .await
+        .expect("Err creating client");
 
     // Finally, start a single shard, and start listening to events.
     //

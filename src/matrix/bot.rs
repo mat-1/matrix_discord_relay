@@ -1,45 +1,25 @@
-use std::{cell::RefCell, env, string, sync::Mutex};
+use std::sync::{Arc, Mutex};
 
 use futures::future;
 use matrix_sdk::room::Joined;
 use ruma::{
-    api::client::appservice,
-    api::{appservice::Registration, client::error::ErrorKind},
-    events::room::message::{RoomMessageEvent, TextMessageEventContent},
-    events::{
-        relation::{InReplyTo, Replacement},
-        room::{
-            member::RoomMemberEventContent,
-            message::{
-                MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
-            }, redaction::OriginalSyncRoomRedactionEvent,
-        },
-        AnyMessageLikeEventContent, AnyTimelineEvent, OriginalSyncMessageLikeEvent,
-        StateEventContent,
+    events::room::{
+        message::{OriginalSyncRoomMessageEvent, Relation},
+        redaction::OriginalSyncRoomRedactionEvent,
     },
-    room_id, EventId, OwnedEventId, OwnedRoomId, RoomId, RoomOrAliasId,
+    EventId, OwnedEventId, RoomId,
 };
 
 use matrix_sdk_appservice::{
-    matrix_sdk::{
-        config::SyncSettings,
-        event_handler::Ctx,
-        room::Room,
-        ruma::{
-            events::room::member::{MembershipState, OriginalSyncRoomMemberEvent},
-            UserId,
-        },
-        sync::SyncResponse,
-        Client,
-    },
+    matrix_sdk::{config::SyncSettings, room::Room, sync::SyncResponse, Client},
     AppService, AppServiceBuilder, AppServiceRegistration, Result,
 };
-use tracing::{info, trace};
-use tracing_subscriber::fmt::format::{self, Full};
+use serenity::http::Http;
 
 use crate::{
     chat_service::{self, FullMessage, Message, User},
-    discord, CONFIG,
+    discord::{self, bot::CONTEXT},
+    CONFIG,
 };
 
 pub static BOT_APPSERVICE: Mutex<Option<AppService>> = Mutex::new(None);
@@ -88,7 +68,6 @@ async fn format_for_reply_event_id(
     let mut relay_msg = message.clone();
 
     let mut reply_header = "".to_owned();
-;
     let reply_data = room
         .event(&reply_id)
         .await
@@ -144,11 +123,7 @@ async fn format_for_reply_event_id(
     //https://discord.com/channels/server/channel/msg
     reply_header = format!("> {} {}", author_ping, header);
 
-    relay_msg.content = format!(
-        "{}\n{}",
-        reply_header,
-        strip_reply(content)
-    );
+    relay_msg.content = format!("{}\n{}", reply_header, strip_reply(content));
     return relay_msg;
 }
 
@@ -161,7 +136,13 @@ async fn format_for_reply(
         match event.content.clone().relates_to.unwrap() {
             Relation::Reply { in_reply_to } => {
                 let reply_id = in_reply_to.event_id;
-                return format_for_reply_event_id(message, reply_id, event.content.body().to_owned(), room).await;
+                return format_for_reply_event_id(
+                    message,
+                    reply_id,
+                    event.content.body().to_owned(),
+                    room,
+                )
+                .await;
             }
             _ => {}
         }
@@ -181,7 +162,10 @@ async fn handle_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
     }
 
     if let Room::Joined(room) = room {
-        let m = CONFIG.room.iter().find(|m| m.matrix == room.room_id().to_string());
+        let m = CONFIG
+            .room
+            .iter()
+            .find(|m| m.matrix == room.room_id().to_string());
         if m.is_none() {
             return;
         }
@@ -226,15 +210,24 @@ async fn handle_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
                     relay_msg.message.id = event_id.to_string();
                     if v["content"]["m.relates_to"].get("m.in_reply_to").is_some() {
                         println!("Is reply!");
-                        let reply_event = v["content"]["m.relates_to"]["m.in_reply_to"]["event_id"].as_str().unwrap();
+                        let reply_event = v["content"]["m.relates_to"]["m.in_reply_to"]["event_id"]
+                            .as_str()
+                            .unwrap();
                         let reply_event = EventId::parse(reply_event).unwrap();
-                        relay_msg = format_for_reply_event_id(relay_msg.clone(), reply_event, relay_msg.clone().content, room).await;
-                    }
-                    else
-                    {
+                        relay_msg = format_for_reply_event_id(
+                            relay_msg.clone(),
+                            reply_event,
+                            relay_msg.clone().content,
+                            room,
+                        )
+                        .await;
+                    } else {
                         println!("Isn't reply!");
                     }
-                    discord::relay::edit_message(relay_msg).await;
+
+                    let http = CONTEXT.lock().clone().unwrap().http;
+
+                    discord::relay::edit_message(&http, relay_msg).await;
                     return;
                 }
                 _ => {}
@@ -244,8 +237,14 @@ async fn handle_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
         println!("sending");
 
         relay_msg = format_for_reply(relay_msg.clone(), event, room).await;
-        let discord_msg = discord::relay::relay_message(relay_msg.clone()).await;
-        chat_service::create_message(relay_msg.message, discord_msg);
+        // let discord_msg = match discord::relay::relay_message(&http, relay_msg.clone()).await {
+        //     Ok(m) => m,
+        //     Err(err) => {
+        //         println!("Error: {}", err);
+        //         return;
+        //     }
+        // };
+        // chat_service::create_message(relay_msg.message, discord_msg);
         // send our message to the room we found the "!party" command in
         // the last parameter is an optional transaction id which we don't
         // care about.
@@ -266,8 +265,7 @@ async fn handle_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
     }
 }
 
-async fn handle_message_redact(event: OriginalSyncRoomRedactionEvent, room: Room)
-{
+async fn handle_message_redact(event: OriginalSyncRoomRedactionEvent, room: Room) {
     if let Room::Joined(room) = room {
         let msg = chat_service::Message {
             service: "matrix".to_owned(),
@@ -275,7 +273,7 @@ async fn handle_message_redact(event: OriginalSyncRoomRedactionEvent, room: Room
             room_id: room.room_id().to_string(),
             id: event.redacts.to_string(),
         };
-        
+
         discord::relay::delete_message(msg.clone()).await;
         chat_service::delete_message(msg.clone());
     }
@@ -351,11 +349,12 @@ pub async fn start_bot() -> Result<()> {
     if !changed_name {
         println!("Failed to set display name");
     }
+    println!("changed_name");
 
     for mroom in CONFIG.room.iter() {
         let roomid = mroom.matrix.clone();
         let id: Box<RoomId> = RoomId::parse_box(roomid.as_ref()).unwrap();
-        user.join_room_by_id(id.as_ref()).await?;
+        let _ = user.join_room_by_id(id.as_ref()).await;
     }
 
     println!("Joined rooms");

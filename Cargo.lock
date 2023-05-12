@@ -1621,6 +1621,7 @@ dependencies = [
  "markdown",
  "matrix-sdk",
  "matrix-sdk-appservice",
+ "parking_lot 0.12.1",
  "reqwest",
  "ruma",
  "rusqlite",

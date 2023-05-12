@@ -1,11 +1,12 @@
 use crate::chat_service::{FullMessage, Message};
 use crate::{chat_service, CONFIG};
+use anyhow::Result;
 use reqwest;
 use serde::Deserialize;
+use serenity::http::Http;
 use std::collections::HashMap;
-use std::fmt::format;
 
-use super::bot::{CONTEXT, relayed_message_to_message};
+use super::bot::{get_or_create_webhook_url, relayed_message_to_message, CONTEXT};
 
 #[derive(Debug, Deserialize, Clone)]
 struct WebhookResponse {
@@ -13,20 +14,15 @@ struct WebhookResponse {
     channel_id: String,
 }
 
-fn sanitize(message: String) -> String
-{
-    let mut out = message.clone();
-    let zero_width_space = "​";
-    let fake_ping = format!("@{}", zero_width_space);
-    out = out.replace("@everyone", format!("{}everyone", fake_ping).as_str());
-    out = out.replace("@here", format!("{}here", fake_ping).as_str());
-    return out;
+fn sanitize(message: &str) -> String {
+    const ZERO_WIDTH_SPACE: &str = "​";
+
+    message.replace("@", &format!("@{ZERO_WIDTH_SPACE}"))
 }
 
-pub async fn delete_message(message: Message)
-{
+pub async fn delete_message(message: Message) {
     let relayed_messages = chat_service::message_relays(message.clone());
-    let http = (*(CONTEXT.lock().unwrap())).as_ref().unwrap().http.clone();
+    let http = (*CONTEXT.lock()).as_ref().unwrap().http.clone();
     if relayed_messages.len() > 0 {
         for msg in relayed_messages {
             if msg.service == "discord" {
@@ -47,21 +43,22 @@ pub async fn delete_message(message: Message)
     }
 }
 
-
 async fn send_message_webhook(
-    webhook: String,
+    webhook_url: String,
     message: String,
     username: Option<String>,
 ) -> WebhookResponse {
     let mut params = HashMap::new();
-    params.insert("content", sanitize(message));
+    params.insert("content", sanitize(&message));
     if username.is_some() {
         params.insert("username", username.unwrap());
     }
 
+    println!("Sending message to {webhook_url}");
+
     let client = reqwest::Client::new();
     let res = client
-        .post(format!("{}?wait=1", webhook))
+        .post(format!("{}?wait=1", webhook_url))
         .form(&params)
         .send()
         .await
@@ -74,12 +71,12 @@ async fn send_message_webhook(
 }
 
 async fn edit_message_webhook(
-    webhook: String,
+    webhook: &str,
     message_id: String,
     message: String,
 ) -> WebhookResponse {
     let mut params = HashMap::new();
-    params.insert("content", sanitize(message));
+    params.insert("content", sanitize(&message));
 
     let client = reqwest::Client::new();
     let res = client
@@ -95,43 +92,54 @@ async fn edit_message_webhook(
     return res;
 }
 
-pub async fn relay_message(message: FullMessage) -> Message {
-    let mut out: Message = message.message.clone();
-    let mut webhook = "".to_owned();
+pub async fn relay_message(http: &Http, message: FullMessage) -> Result<Message> {
     let room = CONFIG
         .room
         .iter()
         .find(|room| room.matrix == message.message.room_id);
-    if room.is_none() {
-        return message.message;
-    }
-
-    out = Message {
-        service: "discord".to_owned(),
-        server_id: room.unwrap().discord_guild.to_owned(),
-        room_id: room.unwrap().discord.clone(),
-        id: message.message.id.clone(),
+    let Some(room) = room else{
+        return Ok(message.message);
     };
-    webhook = room.unwrap().webhook.clone();
+
+    let webhook_url = get_or_create_webhook_url(http, room.discord).await?;
 
     let wh = send_message_webhook(
-        webhook,
+        webhook_url,
         message.content,
         Some(format!("{} ({})", message.user.display, message.user.tag).to_owned()),
     )
     .await;
-    out.id = wh.id;
-    return out;
+
+    Ok(Message {
+        service: "discord".to_owned(),
+        server_id: room.discord_guild.to_string(),
+        room_id: room.discord.to_string(),
+        id: wh.id,
+    })
 }
 
-pub async fn edit_message(message: FullMessage) {
-    let room = CONFIG.room.iter().find(|room| room.matrix == message.message.room_id);
-    let webhook = room.unwrap().webhook.clone();
+pub async fn edit_message(http: &Http, message: FullMessage) {
+    let room = CONFIG
+        .room
+        .iter()
+        .find(|room| room.matrix == message.message.room_id);
+
+    let Some(room) = room else {
+        return;
+    };
+
+    let webhook_url = match get_or_create_webhook_url(http, room.discord).await {
+        Ok(w) => w,
+        Err(err) => {
+            println!("Error getting webhook: {}", err);
+            return;
+        }
+    };
 
     let relayed_messages = chat_service::message_relays(message.clone().message);
     for msg in relayed_messages {
         if msg.service == "discord" {
-            edit_message_webhook(webhook.clone(), msg.id, message.clone().content).await;
+            edit_message_webhook(&webhook_url, msg.id, message.clone().content).await;
         }
     }
 }
